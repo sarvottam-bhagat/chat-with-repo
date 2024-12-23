@@ -9,7 +9,7 @@ import random
 st.set_page_config(page_title='Chat with Repo- Gemini API', page_icon="✨")
 
 
-# Repo cloning path
+# Repo cloning path here
 data_dir = './repo'
 
 # configure the model
