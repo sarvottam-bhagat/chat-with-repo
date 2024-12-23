@@ -1,0 +1,5 @@
+__pycache__/*
+venv/*
+repo/*
+.env
+secrets.toml
