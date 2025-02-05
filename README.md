@@ -3,3 +3,6 @@
 
 
 [Demo Link](https://repochat-gemini.streamlit.app/)
+
+# Deployed on render 
+https://chat-with-repo.onrender.com
