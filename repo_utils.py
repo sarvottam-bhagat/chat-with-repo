@@ -1,53 +1,61 @@
 import git
 import os
 import re
-import concurrent.futures
-import chardet
-import chardet
+import uuid
 import json
 import shutil
+import chardet
+import stat
+import time
+import concurrent.futures
+from typing import Dict
 
+def delete_directory(repo_clone_path: str) -> None:
+    """Safely delete a directory with retries and permission handling"""
+    if not os.path.exists(repo_clone_path):
+        return
 
+    # Handle Windows file locking
+    def on_error(func, path, exc_info):
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
 
-def delete_directory(repo_clone_path):
-    try:
-        shutil.rmtree(repo_clone_path)
-        print(f"Successfully deleted directory: {repo_clone_path}")
-    except Exception as e:
-        print(f"Error deleting directory {repo_clone_path}: {e}")
-
-
-def get_reponame(repo_url):
-    repo_url = repo_url.rstrip('/')
+    for _ in range(3):  # Retry up to 3 times
+        try:
+            shutil.rmtree(repo_clone_path, onerror=on_error)
+            print(f"Successfully deleted: {repo_clone_path}")
+            return
+        except Exception as e:
+            print(f"Error deleting directory: {str(e)}")
+            time.sleep(0.5)
     
+    raise RuntimeError(f"Failed to delete directory after 3 attempts: {repo_clone_path}")
+
+def get_reponame(repo_url: str) -> str:
+    """Extract repository name and branch from URL"""
+    repo_url = repo_url.rstrip('/')
     parts = repo_url.split('/')
     username = parts[3]
     reponame = parts[4]
 
-    # Check if the URL contains a branch
     if len(parts) > 5 and parts[5] == 'tree':
         branchname = parts[6]
-        combined_string = f"{username}+{reponame}+{branchname}"
-    else:
-        combined_string = f"{username}+{reponame}"
+        return f"{username}+{reponame}+{branchname}"
+    return f"{username}+{reponame}"
 
-    return combined_string
-
-
-
-def clone_github_repo(repo_url, clone_path):
+def clone_github_repo(repo_url: str, clone_path: str) -> None:
+    """Clone a GitHub repository with branch support"""
     try:
         repo_url = repo_url.rstrip('/')
-
         pattern = re.compile(r'^https://github\.com/([^/]+)/([^/]+)(/tree/([^/]+))?$')
         match = pattern.match(repo_url)
 
         if not match:
-            raise ValueError("Invalid GitHub repository URL")
+            raise ValueError("Invalid GitHub URL format")
 
         username, reponame, _, branchname = match.groups()
-
         base_repo_url = f"https://github.com/{username}/{reponame}.git"
+
         if not os.path.exists(clone_path):
             os.makedirs(clone_path)
 
@@ -55,23 +63,29 @@ def clone_github_repo(repo_url, clone_path):
             git.Repo.clone_from(base_repo_url, clone_path, branch=branchname)
         else:
             git.Repo.clone_from(base_repo_url, clone_path)
-        
-        print(f"Repository cloned to {clone_path}")
+
+        print(f"Successfully cloned to {clone_path}")
     except Exception as e:
-        print(f"Failed to clone repository: {e}")
+        raise RuntimeError(f"Cloning failed: {str(e)}")
 
-
-def is_valid_repolink(repolink):
-    pattern = re.compile(r'^https://github\.com/[^/]+/[^/]+(/tree/[^/]+)?/?$')
+def is_valid_repolink(repolink: str) -> bool:
+    """Validate GitHub repository URL format"""
+    pattern = re.compile(
+        r'^https://github\.com/[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(/tree/[a-zA-Z0-9_.-]+)?/?$'
+    )
     return bool(pattern.match(repolink))
 
-def process_file(file_path, clone_path):
+def process_file(file_path: str, clone_path: str) -> tuple:
+    """Process individual files with encoding detection"""
     relative_path = os.path.relpath(file_path, clone_path)
     try:
         with open(file_path, 'rb') as f:
             raw_data = f.read()
+            
+            if not raw_data:
+                return (relative_path, "")
+
             if file_path.endswith('.ipynb'):
-                # Handle Jupyter notebook files
                 try:
                     content = json.loads(raw_data)
                     cell_sources = [
@@ -79,27 +93,23 @@ def process_file(file_path, clone_path):
                         for cell in content.get('cells', [])
                         if cell.get('cell_type') in ('markdown', 'code')
                     ]
-                    text = '\n'.join(cell_sources)
-                    return relative_path, text
-                except json.JSONDecodeError as e:
-                    print(f"Failed to parse notebook {file_path}: {e}")
-                    return None
-            else:
-                # Handle other text files
-                result = chardet.detect(raw_data)
-                encoding = result['encoding']
-                if encoding is not None:
-                    text = raw_data.decode(encoding)
-                    return relative_path, text
-                else:
-                    print(f"Skipping non-text file: {file_path}")
-                    return None
-    except Exception as e:
-        print(f"Failed to read {file_path}: {e}")
-        return None
+                    return (relative_path, '\n'.join(cell_sources))
+                except json.JSONDecodeError:
+                    return (relative_path, "Invalid notebook format")
 
-def create_file_content_dict(clone_path):
-    print('Processing Files')
+            # Detect encoding for text files
+            encoding = chardet.detect(raw_data)['encoding']
+            if encoding:
+                return (relative_path, raw_data.decode(encoding))
+            
+            return (relative_path, "Binary file (not shown)")
+
+    except Exception as e:
+        print(f"Error processing {file_path}: {e}")
+        return (relative_path, f"File processing error: {str(e)}")
+
+def create_file_content_dict(clone_path: str) -> Dict[str, str]:
+    """Create a dictionary of file contents using parallel processing"""
     file_content_dict = {}
     files_to_process = []
 
@@ -111,12 +121,30 @@ def create_file_content_dict(clone_path):
             files_to_process.append(file_path)
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = {executor.submit(process_file, file_path, clone_path): file_path for file_path in files_to_process}
+        futures = {
+            executor.submit(process_file, fp, clone_path): fp 
+            for fp in files_to_process
+        }
+        
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
-            if result is not None:
-                relative_path, text = result
-                file_content_dict[relative_path] = text
+            if result:
+                path, content = result
+                file_content_dict[path] = content
 
-    print(f"Processed {len(file_content_dict)} files.")
     return file_content_dict
+
+def get_default_branch_code(repo_url: str) -> Dict[str, str]:
+    """Clone and process default branch for comparison"""
+    base_url = repo_url.split('/tree/')[0]
+    unique_id = uuid.uuid4().hex
+    clone_path = f"./repo/default_branch_{unique_id}"
+    
+    try:
+        print(f"Cloning default branch to {clone_path}")
+        clone_github_repo(base_url, clone_path)
+        return create_file_content_dict(clone_path)
+    except Exception as e:
+        raise RuntimeError(f"Default branch clone failed: {str(e)}")
+    finally:
+        delete_directory(clone_path)
